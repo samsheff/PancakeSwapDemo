@@ -3,6 +3,7 @@ pragma solidity ^0.8.19;
 
 import "./interfaces/IPancakeFactory.sol";
 import "./interfaces/IPancakePair.sol";
+import "./interfaces/IPancakeRouter.sol";
 import "./interfaces/IWBNB.sol";
 import "../lib/forge-std/src/interfaces/IERC20.sol";
 
@@ -14,6 +15,7 @@ import "../lib/forge-std/src/interfaces/IERC20.sol";
 contract PancakeDirectSwap {
     // BSC Mainnet addresses
     address private constant PANCAKE_FACTORY = 0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73;
+    address private constant PANCAKE_ROUTER = 0x10ED43C718714eb63d5aA57B78B54704E256024E;
     address private constant WBNB = 0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c;
     
     // Events
@@ -22,6 +24,14 @@ contract PancakeDirectSwap {
         address indexed tokenOut,
         uint256 amountIn,
         uint256 amountOut
+    );
+    
+    event LiquidityAdded(
+        address indexed user,
+        address indexed token,
+        uint256 amountToken,
+        uint256 amountBNB,
+        uint256 liquidity
     );
     
     // Custom errors
@@ -92,6 +102,127 @@ contract PancakeDirectSwap {
         }
         
         emit SwapExecuted(msg.sender, tokenOut, amountIn, amountOut);
+    }
+    
+    /**
+     * @dev Swap BNB for tokens and add liquidity back to the pool
+     * @param amountOut The exact amount of tokens to receive from swap
+     * @param tokenOut The address of the token to receive
+     * @param amountBNBLiquidity The amount of BNB to use for adding liquidity
+     * @param amountTokenMin Minimum amount of tokens to add to liquidity
+     * @param amountBNBMin Minimum amount of BNB to add to liquidity
+     * @param deadline The deadline for the transaction
+     * @return amountIn The amount of BNB used for the swap
+     * @return amountToken Amount of tokens added to liquidity
+     * @return amountBNB Amount of BNB added to liquidity
+     * @return liquidity Amount of LP tokens received
+     */
+    function swapAndAddLiquidity(
+        uint256 amountOut,
+        address tokenOut,
+        uint256 amountBNBLiquidity,
+        uint256 amountTokenMin,
+        uint256 amountBNBMin,
+        uint256 deadline
+    ) external payable nonReentrant returns (
+        uint256 amountIn,
+        uint256 amountToken,
+        uint256 amountBNB,
+        uint256 liquidity
+    ) {
+        // Validate inputs
+        if (block.timestamp > deadline) revert DeadlineExpired();
+        if (amountOut == 0) revert InsufficientOutputAmount();
+        if (tokenOut == address(0) || tokenOut == WBNB) revert InvalidToken();
+        if (amountBNBLiquidity == 0) revert InsufficientInputAmount();
+        
+        // Execute swap first
+        amountIn = _executeSwapForLiquidity(tokenOut, amountOut, amountBNBLiquidity);
+        
+        // Add liquidity
+        (amountToken, amountBNB, liquidity) = _addLiquidityAfterSwap(
+            tokenOut,
+            amountOut,
+            amountBNBLiquidity,
+            amountTokenMin,
+            amountBNBMin,
+            deadline
+        );
+        
+        // Handle refunds and transfers
+        _handleRefundsAndTransfers(tokenOut, amountOut, amountToken, amountIn, amountBNB);
+        
+        emit SwapExecuted(msg.sender, tokenOut, amountIn, amountOut);
+        emit LiquidityAdded(msg.sender, tokenOut, amountToken, amountBNB, liquidity);
+    }
+    
+    /**
+     * @dev Internal function to execute swap for liquidity operation
+     */
+    function _executeSwapForLiquidity(
+        address tokenOut,
+        uint256 amountOut,
+        uint256 amountBNBLiquidity
+    ) private returns (uint256 amountIn) {
+        address pair = _getPair(WBNB, tokenOut);
+        if (pair == address(0)) revert PairNotFound();
+        
+        (uint256 reserveIn, uint256 reserveOut) = _getReserves(pair, WBNB, tokenOut);
+        amountIn = _getAmountIn(amountOut, reserveIn, reserveOut);
+        
+        if (msg.value < amountIn + amountBNBLiquidity) revert InsufficientInputAmount();
+        
+        IWBNB(WBNB).deposit{value: amountIn}();
+        if (!IWBNB(WBNB).transfer(pair, amountIn)) revert TransferFailed();
+        _swap(pair, WBNB, tokenOut, amountOut, address(this));
+    }
+    
+    /**
+     * @dev Internal function to add liquidity after swap
+     */
+    function _addLiquidityAfterSwap(
+        address tokenOut,
+        uint256 amountOut,
+        uint256 amountBNBLiquidity,
+        uint256 amountTokenMin,
+        uint256 amountBNBMin,
+        uint256 deadline
+    ) private returns (uint256 amountToken, uint256 amountBNB, uint256 liquidity) {
+        IERC20(tokenOut).approve(PANCAKE_ROUTER, amountOut);
+        
+        (amountToken, amountBNB, liquidity) = IPancakeRouter(PANCAKE_ROUTER).addLiquidityETH{
+            value: amountBNBLiquidity
+        }(
+            tokenOut,
+            amountOut,
+            amountTokenMin,
+            amountBNBMin,
+            msg.sender,
+            deadline
+        );
+    }
+    
+    /**
+     * @dev Internal function to handle refunds and transfers
+     */
+    function _handleRefundsAndTransfers(
+        address tokenOut,
+        uint256 amountOut,
+        uint256 amountToken,
+        uint256 amountIn,
+        uint256 amountBNB
+    ) private {
+        // Transfer remaining tokens to user
+        if (amountOut > amountToken) {
+            if (!IERC20(tokenOut).transfer(msg.sender, amountOut - amountToken)) revert TransferFailed();
+        }
+        
+        // Refund excess BNB
+        uint256 totalUsed = amountIn + amountBNB;
+        if (msg.value > totalUsed) {
+            (bool success, ) = msg.sender.call{value: msg.value - totalUsed}("");
+            if (!success) revert TransferFailed();
+        }
     }
     
     /**
@@ -169,6 +300,29 @@ contract PancakeDirectSwap {
         
         (uint256 reserveIn, uint256 reserveOut) = _getReserves(pair, WBNB, tokenOut);
         amountIn = _getAmountIn(amountOut, reserveIn, reserveOut);
+    }
+    
+    /**
+     * @dev Get total BNB needed for swap and liquidity operations
+     * @param amountOut Desired token output from swap
+     * @param tokenOut Token to receive
+     * @param amountBNBLiquidity BNB amount for liquidity
+     * @return totalBNBNeeded Total BNB required for both operations
+     */
+    function getTotalBNBNeeded(
+        uint256 amountOut,
+        address tokenOut,
+        uint256 amountBNBLiquidity
+    ) external view returns (uint256 totalBNBNeeded) {
+        if (tokenOut == address(0) || tokenOut == WBNB) revert InvalidToken();
+        
+        address pair = _getPair(WBNB, tokenOut);
+        if (pair == address(0)) revert PairNotFound();
+        
+        (uint256 reserveIn, uint256 reserveOut) = _getReserves(pair, WBNB, tokenOut);
+        uint256 swapBNBNeeded = _getAmountIn(amountOut, reserveIn, reserveOut);
+        
+        totalBNBNeeded = swapBNBNeeded + amountBNBLiquidity;
     }
     
     /**

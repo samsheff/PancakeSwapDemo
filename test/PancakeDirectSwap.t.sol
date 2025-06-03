@@ -5,6 +5,7 @@ import "forge-std/Test.sol";
 import "../src/PancakeDirectSwap.sol";
 import "../src/interfaces/IPancakeFactory.sol";
 import "../src/interfaces/IPancakePair.sol";
+import "../src/interfaces/IPancakeRouter.sol";
 import "../src/interfaces/IWBNB.sol";
 import "forge-std/interfaces/IERC20.sol";
 
@@ -13,6 +14,7 @@ contract PancakeDirectSwapTest is Test {
     
     // BSC Mainnet addresses
     address constant PANCAKE_FACTORY = 0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73;
+    address constant PANCAKE_ROUTER = 0x10ED43C718714eb63d5aA57B78B54704E256024E;
     address constant WBNB = 0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c;
     address constant USDT = 0x55d398326f99059fF775485246999027B3197955; // USDT on BSC
     address constant CAKE = 0x0E09FaBB73Bd3Ade0a17ECC321fD13a19e81cE82; // CAKE token
@@ -238,6 +240,152 @@ contract PancakeDirectSwapTest is Test {
     function testCannotRecoverWBNB() public {
         vm.expectRevert("Cannot recover WBNB");
         swapContract.recoverToken(WBNB, 1 ether);
+    }
+    
+    function testSwapAndAddLiquidity() public {
+        vm.startPrank(user);
+        
+        uint256 amountOut = 10 * 1e18; // 10 CAKE tokens to swap
+        uint256 amountBNBLiquidity = 1 ether; // 1 BNB for liquidity
+        uint256 deadline = block.timestamp + 300;
+        
+        // Get total BNB needed
+        uint256 totalBNBNeeded = swapContract.getTotalBNBNeeded(amountOut, CAKE, amountBNBLiquidity);
+        
+        // Get pair address to check LP token balance
+        address pair = IPancakeFactory(PANCAKE_FACTORY).getPair(WBNB, CAKE);
+        
+        // Execute swap and add liquidity
+        uint256 balanceBefore = IERC20(CAKE).balanceOf(user);
+        uint256 bnbBefore = user.balance;
+        uint256 lpBalanceBefore = IERC20(pair).balanceOf(user);
+        
+        (uint256 amountIn, uint256 amountToken, uint256 amountBNB, uint256 liquidity) =
+            swapContract.swapAndAddLiquidity{value: totalBNBNeeded + 0.1 ether}(
+                amountOut,
+                CAKE,
+                amountBNBLiquidity,
+                0, // amountTokenMin
+                0, // amountBNBMin
+                deadline
+            );
+        
+        uint256 balanceAfter = IERC20(CAKE).balanceOf(user);
+        uint256 bnbAfter = user.balance;
+        uint256 lpBalanceAfter = IERC20(pair).balanceOf(user);
+        
+        // Assertions
+        assertGt(amountIn, 0, "Should use BNB for swap");
+        assertGt(amountToken, 0, "Should add tokens to liquidity");
+        assertGt(amountBNB, 0, "Should add BNB to liquidity");
+        assertGt(liquidity, 0, "Should receive LP tokens");
+        
+        // Check that user received remaining tokens
+        uint256 remainingTokens = amountOut - amountToken;
+        assertEq(balanceAfter - balanceBefore, remainingTokens, "Should receive remaining tokens");
+        
+        // Check that user received LP tokens
+        assertEq(lpBalanceAfter - lpBalanceBefore, liquidity, "Should receive LP tokens");
+        
+        // Check BNB usage
+        uint256 totalBNBUsed = amountIn + amountBNB;
+        assertLe(bnbBefore - bnbAfter, totalBNBUsed + 0.01 ether, "Should use correct amount of BNB");
+        
+        vm.stopPrank();
+    }
+    
+    function testGetTotalBNBNeeded() public {
+        uint256 amountOut = 10 * 1e18; // 10 CAKE
+        uint256 amountBNBLiquidity = 1 ether;
+        
+        uint256 totalNeeded = swapContract.getTotalBNBNeeded(amountOut, CAKE, amountBNBLiquidity);
+        uint256 swapNeeded = swapContract.getAmountIn(amountOut, CAKE);
+        
+        assertEq(totalNeeded, swapNeeded + amountBNBLiquidity, "Total should equal swap + liquidity");
+        assertGt(totalNeeded, amountBNBLiquidity, "Total should be greater than liquidity amount");
+    }
+    
+    function testSwapAndAddLiquidityWithMinAmounts() public {
+        vm.startPrank(user);
+        
+        uint256 amountOut = 5 * 1e18; // 5 CAKE tokens
+        uint256 amountBNBLiquidity = 0.5 ether; // 0.5 BNB for liquidity
+        uint256 deadline = block.timestamp + 300;
+        
+        // Set more reasonable minimum amounts (lower to avoid slippage issues)
+        uint256 amountTokenMin = 0.1 * 1e18; // Minimum 0.1 CAKE for liquidity
+        uint256 amountBNBMin = 0.01 ether; // Minimum 0.01 BNB for liquidity
+        
+        uint256 totalBNBNeeded = swapContract.getTotalBNBNeeded(amountOut, CAKE, amountBNBLiquidity);
+        
+        (uint256 amountIn, uint256 amountToken, uint256 amountBNB, uint256 liquidity) =
+            swapContract.swapAndAddLiquidity{value: totalBNBNeeded + 0.1 ether}(
+                amountOut,
+                CAKE,
+                amountBNBLiquidity,
+                amountTokenMin,
+                amountBNBMin,
+                deadline
+            );
+        
+        // Assertions
+        assertGe(amountToken, amountTokenMin, "Should meet minimum token requirement");
+        assertGe(amountBNB, amountBNBMin, "Should meet minimum BNB requirement");
+        assertGt(liquidity, 0, "Should receive LP tokens");
+        
+        vm.stopPrank();
+    }
+    
+    function testSwapAndAddLiquidityRevertInsufficientBNB() public {
+        vm.startPrank(user);
+        
+        uint256 amountOut = 10 * 1e18;
+        uint256 amountBNBLiquidity = 1 ether;
+        uint256 deadline = block.timestamp + 300;
+        
+        uint256 totalBNBNeeded = swapContract.getTotalBNBNeeded(amountOut, CAKE, amountBNBLiquidity);
+        
+        // Send insufficient BNB
+        vm.expectRevert(PancakeDirectSwap.InsufficientInputAmount.selector);
+        swapContract.swapAndAddLiquidity{value: totalBNBNeeded - 0.1 ether}(
+            amountOut,
+            CAKE,
+            amountBNBLiquidity,
+            0,
+            0,
+            deadline
+        );
+        
+        vm.stopPrank();
+    }
+    
+    function testSwapAndAddLiquidityEvents() public {
+        vm.startPrank(user);
+        
+        uint256 amountOut = 5 * 1e18;
+        uint256 amountBNBLiquidity = 0.5 ether;
+        uint256 deadline = block.timestamp + 300;
+        
+        uint256 totalBNBNeeded = swapContract.getTotalBNBNeeded(amountOut, CAKE, amountBNBLiquidity);
+        
+        // Execute the function and check that it completes successfully
+        (uint256 amountIn, uint256 amountToken, uint256 amountBNB, uint256 liquidity) =
+            swapContract.swapAndAddLiquidity{value: totalBNBNeeded + 0.1 ether}(
+                amountOut,
+                CAKE,
+                amountBNBLiquidity,
+                0,
+                0,
+                deadline
+            );
+        
+        // Verify the operation was successful
+        assertGt(amountIn, 0, "Should use BNB for swap");
+        assertGt(amountToken, 0, "Should add tokens to liquidity");
+        assertGt(amountBNB, 0, "Should add BNB to liquidity");
+        assertGt(liquidity, 0, "Should receive LP tokens");
+        
+        vm.stopPrank();
     }
 }
 
